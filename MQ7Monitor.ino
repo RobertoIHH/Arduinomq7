@@ -12,10 +12,12 @@
 // UUID del servicio Bluetooth
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"  // UUID del servicio
 #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"  // UUID de la característica
+#define COMMAND_CHAR_UUID   "beb5483e-36e1-4688-b7f5-ea07361b26a9"  // UUID para característica de comandos
 
 // Variables globales para Bluetooth
 BLEServer* pServer = NULL;  // Servidor BLE
-BLECharacteristic* pCharacteristic = NULL;  // Característica BLE
+BLECharacteristic* pCharacteristic = NULL;  // Característica BLE para datos
+BLECharacteristic* pCommandCharacteristic = NULL;  // Característica BLE para comandos
 bool deviceConnected = false;  // Estado de conexión del dispositivo
 bool oldDeviceConnected = false;  // Estado de conexión anterior
 unsigned long previousMillis = 0;  // Tiempo anterior
@@ -35,7 +37,10 @@ const int READ_SAMPLE_TIMES = 5;       // Número de muestras
 enum GasType {
   GAS_CO = 0,        // Monóxido de carbono
   GAS_HYDROGEN = 1,  // Hidrógeno
-  GAS_COUNT = 2      // Total de gases soportados
+  GAS_LPG = 2,       // Gas licuado de petróleo (LPG)
+  GAS_METHANE = 3,   // Metano (CH4)
+  GAS_ALCOHOL = 4,   // Alcohol
+  GAS_COUNT = 5      // Total de gases soportados
 };
 
 // Estructura para almacenar parámetros de calibración
@@ -64,12 +69,31 @@ GasCalibration gasCalibrations[GAS_COUNT] = {
     50.0f, 1.36f,       // Punto inicial
     4000.0f, 0.09f,     // Punto final
     0.0f, 0.0f          // Scope y coord se calcularán
+  },
+  // Gas licuado de petróleo (LPG)
+  {
+    "LPG",
+    200.0f, 1.8f,       // Punto inicial
+    10000.0f, 0.35f,    // Punto final
+    0.0f, 0.0f          // Scope y coord se calcularán
+  },
+  // Metano (CH4)
+  {
+    "CH4",
+    500.0f, 2.1f,       // Punto inicial
+    10000.0f, 0.65f,    // Punto final
+    0.0f, 0.0f          // Scope y coord se calcularán
+  },
+  // Alcohol
+  {
+    "Alcohol",
+    100.0f, 2.0f,       // Punto inicial
+    2000.0f, 0.5f,      // Punto final
+    0.0f, 0.0f          // Scope y coord se calcularán
   }
 };
 
-// Variables de control para rotación de gases
-unsigned long lastGasChangeTime = 0;
-const unsigned long GAS_CHANGE_INTERVAL = 10000; // Cambiar gas cada 10 segundos
+// Variable para el gas actual seleccionado por la aplicación
 int currentGasIndex = GAS_CO;
 
 // Función para inicializar calibraciones
@@ -110,6 +134,42 @@ class MyServerCallbacks: public BLEServerCallbacks {
     }
 };
 
+// Clase para manejar los comandos recibidos desde la aplicación
+class CommandCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+      std::string value = pCharacteristic->getValue();
+      
+      if (value.length() > 0) {
+        Serial.print("Comando recibido: ");
+        Serial.println(value.c_str());
+        
+        // Procesar el comando para cambiar el tipo de gas
+        if (value.length() >= 3) {
+          if (value.substr(0, 3) == "CO:") {
+            currentGasIndex = GAS_CO;
+            Serial.println("Cambiando a CO");
+          }
+          else if (value.substr(0, 3) == "H2:") {
+            currentGasIndex = GAS_HYDROGEN;
+            Serial.println("Cambiando a H2");
+          }
+          else if (value.substr(0, 4) == "LPG:") {
+            currentGasIndex = GAS_LPG;
+            Serial.println("Cambiando a LPG");
+          }
+          else if (value.substr(0, 4) == "CH4:") {
+            currentGasIndex = GAS_METHANE;
+            Serial.println("Cambiando a CH4");
+          }
+          else if (value.substr(0, 8) == "Alcohol:") {
+            currentGasIndex = GAS_ALCOHOL;
+            Serial.println("Cambiando a Alcohol");
+          }
+        }
+      }
+    }
+};
+
 // Obtener la resistencia del sensor a partir de la lectura analógica
 float getMQResistance(int raw_adc) {
   // Convertir ADC a voltaje (para ESP32 con ADC de 12 bits)
@@ -135,7 +195,7 @@ float readMQ(int mq_pin) {
 void setup() {
   Serial.begin(115200);  // Iniciar comunicación serial
   Serial.println("Iniciando sensor MQ7 con Bluetooth...");  // Mensaje de inicio
-   initGasCalibrations();
+  initGasCalibrations();
   
   // Para ESP32, usamos analogReadResolution en lugar de las funciones de driver/adc.h
   analogReadResolution(12);  // Configurar resolución ADC a 12 bits
@@ -145,6 +205,8 @@ void setup() {
   pServer = BLEDevice::createServer();  // Crear servidor BLE
   pServer->setCallbacks(new MyServerCallbacks());  // Establecer callbacks de conexión
   BLEService *pService = pServer->createService(SERVICE_UUID);  // Crear servicio BLE
+  
+  // Característica para datos del sensor
   pCharacteristic = pService->createCharacteristic(
                      CHARACTERISTIC_UUID,
                      BLECharacteristic::PROPERTY_READ |
@@ -152,6 +214,15 @@ void setup() {
                      BLECharacteristic::PROPERTY_NOTIFY
                    );  // Crear característica BLE
   pCharacteristic->addDescriptor(new BLE2902());  // Agregar descriptor de notificación
+  
+  // Característica para comandos desde la app
+  pCommandCharacteristic = pService->createCharacteristic(
+                     COMMAND_CHAR_UUID,
+                     BLECharacteristic::PROPERTY_READ |
+                     BLECharacteristic::PROPERTY_WRITE
+                   );
+  pCommandCharacteristic->setCallbacks(new CommandCallbacks());
+  
   pService->start();  // Iniciar servicio BLE
   
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();  // Obtener objeto de publicidad
@@ -162,21 +233,13 @@ void setup() {
   BLEDevice::startAdvertising();  // Iniciar publicidad
   
   Serial.println("ESP32-S3 MQ7 BLE está listo para conectarse!");  // Mensaje de listo
-  Serial.println("Calibración para CO:");  // Mensaje de calibración
+  Serial.println("Calibración para gases:");  // Mensaje de calibración
   Serial.print("R0 (KΩ): ");  // Imprimir R0
   Serial.println(R0);
 }
 
 void loop() {
   unsigned long currentMillis = millis();  // Obtener tiempo actual
-  // Rotación entre gases
-  if (currentMillis - lastGasChangeTime >= GAS_CHANGE_INTERVAL) {
-    lastGasChangeTime = currentMillis;
-    currentGasIndex = (currentGasIndex + 1) % GAS_COUNT;
-    Serial.print("Cambiando a gas: ");
-    Serial.println(gasCalibrations[currentGasIndex].name);
-  }
-
 
   // Enviar datos cada intervalo definido
   if (currentMillis - previousMillis >= interval) {
@@ -189,7 +252,7 @@ void loop() {
       // Calcular relación Rs/R0
       float rs_ro_ratio = rs_med / R0;  // Calcular relación Rs/R0
       
-      // Calcular la concentración de CO en PPM
+      // Calcular la concentración del gas en PPM
       float ppm = getGasConcentration(rs_ro_ratio, currentGasIndex);  // Calcular concentración para el gas actual
       
       // Valor ADC puro para referencia
