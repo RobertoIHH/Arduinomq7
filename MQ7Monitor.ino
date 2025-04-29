@@ -73,22 +73,22 @@ GasCalibration gasCalibrations[GAS_COUNT] = {
   // Gas licuado de petróleo (LPG)
   {
     "LPG",
-    200.0f, 1.8f,       // Punto inicial
-    10000.0f, 0.35f,    // Punto final
+    50.0f, 9.0f,       // Punto inicial
+    4000.0f, 5.0f,    // Punto final
     0.0f, 0.0f          // Scope y coord se calcularán
   },
   // Metano (CH4)
   {
     "CH4",
-    500.0f, 2.1f,       // Punto inicial
-    10000.0f, 0.65f,    // Punto final
+    50.0f, 15.0f,       // Punto inicial
+    4000.0f, 9.0f,    // Punto final
     0.0f, 0.0f          // Scope y coord se calcularán
   },
   // Alcohol
   {
     "Alcohol",
-    100.0f, 2.0f,       // Punto inicial
-    2000.0f, 0.5f,      // Punto final
+    50.0f, 17.0f,       // Punto inicial
+    4000.0f, 13.0f,      // Punto final
     0.0f, 0.0f          // Scope y coord se calcularán
   }
 };
@@ -137,34 +137,37 @@ class MyServerCallbacks: public BLEServerCallbacks {
 // Clase para manejar los comandos recibidos desde la aplicación
 class CommandCallbacks: public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *pCharacteristic) {
-      std::string value = pCharacteristic->getValue();
+      // Corregido: usar correctamente la función getValue() para obtener el valor
+      String valueStr = pCharacteristic->getValue();
       
-      if (value.length() > 0) {
+      if (valueStr.length() > 0) {
         Serial.print("Comando recibido: ");
-        Serial.println(value.c_str());
+        Serial.println(valueStr.c_str());
         
         // Procesar el comando para cambiar el tipo de gas
-        if (value.length() >= 3) {
-          if (value.substr(0, 3) == "CO:") {
-            currentGasIndex = GAS_CO;
-            Serial.println("Cambiando a CO");
-          }
-          else if (value.substr(0, 3) == "H2:") {
-            currentGasIndex = GAS_HYDROGEN;
-            Serial.println("Cambiando a H2");
-          }
-          else if (value.substr(0, 4) == "LPG:") {
-            currentGasIndex = GAS_LPG;
-            Serial.println("Cambiando a LPG");
-          }
-          else if (value.substr(0, 4) == "CH4:") {
-            currentGasIndex = GAS_METHANE;
-            Serial.println("Cambiando a CH4");
-          }
-          else if (value.substr(0, 8) == "Alcohol:") {
-            currentGasIndex = GAS_ALCOHOL;
-            Serial.println("Cambiando a Alcohol");
-          }
+        // Verificar si el comando comienza con alguno de los nombres de gas
+        if (valueStr.startsWith("CO:")) {
+          currentGasIndex = GAS_CO;
+          Serial.println("Cambiando a CO");
+        }
+        else if (valueStr.startsWith("H2:")) {
+          currentGasIndex = GAS_HYDROGEN;
+          Serial.println("Cambiando a H2");
+        }
+        else if (valueStr.startsWith("LPG:")) {
+          currentGasIndex = GAS_LPG;
+          Serial.println("Cambiando a LPG");
+        }
+        else if (valueStr.startsWith("CH4:")) {
+          currentGasIndex = GAS_METHANE;
+          Serial.println("Cambiando a CH4");
+        }
+        else if (valueStr.startsWith("ALCOHOL:")) {
+          currentGasIndex = GAS_ALCOHOL;
+          Serial.println("Cambiando a Alcohol");
+        }
+        else {
+          Serial.println("Comando no reconocido");
         }
       }
     }
@@ -262,9 +265,9 @@ void loop() {
       float voltage = mq7Value * (3.3 / 4095.0);  // Conversión de ADC a voltaje
       
       // Crear string con los datos en formato JSON
-      char txString[80];  // Buffer para string
-      sprintf(txString, "{\"ADC\":%d,\"V\":%.2f,\"Rs\":%.2f,\"Rs/R0\":%.3f,\"ppm\":%.2f,\"gas\":\"%s\"}", 
-              mq7Value, voltage, rs_med, rs_ro_ratio, ppm, gasCalibrations[currentGasIndex].name);  // Formatear string
+      char txString[100];  // Buffer para string más grande (100 bytes)
+      sprintf(txString, "{\"ADC\":%d,\"V\":%.2f,\"Rs\":%.2f,\"Rs/R0\":%.3f,\"ppm\":%.2f,\"gas\":\"%s\",\"timestamp\":%lu}", 
+        mq7Value, voltage, rs_med, rs_ro_ratio, ppm, gasCalibrations[currentGasIndex].name, millis());  // Añadir timestamp
       
       // Enviar los datos a través de Bluetooth
       pCharacteristic->setValue(txString);  // Establecer valor de característica
