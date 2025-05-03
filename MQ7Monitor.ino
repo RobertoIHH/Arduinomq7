@@ -4,8 +4,6 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 
-// No incluimos driver/adc.h para evitar conflictos con la biblioteca de ESP32
-
 // Configuración de pines
 #define MQ7_PIN 3  // Pin analógico para conectar el sensor MQ7 (ajustar según tu conexión)
 
@@ -13,26 +11,33 @@
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"  // UUID del servicio
 #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"  // UUID de la característica
 #define COMMAND_CHAR_UUID   "beb5483e-36e1-4688-b7f5-ea07361b26a9"  // UUID para característica de comandos
+#define STATUS_CHAR_UUID    "beb5483e-36e1-4688-b7f5-ea07361b26aa"  // UUID para característica de estado
 
 // Variables globales para Bluetooth
 BLEServer* pServer = NULL;  // Servidor BLE
 BLECharacteristic* pCharacteristic = NULL;  // Característica BLE para datos
 BLECharacteristic* pCommandCharacteristic = NULL;  // Característica BLE para comandos
+BLECharacteristic* pStatusCharacteristic = NULL;  // Característica BLE para estado
 bool deviceConnected = false;  // Estado de conexión del dispositivo
 bool oldDeviceConnected = false;  // Estado de conexión anterior
 unsigned long previousMillis = 0;  // Tiempo anterior
 const long interval = 1000;  // Intervalo de envío de datos (1 segundo)
 
+// Variables para la gestión de cambio de gas
+bool gasChangeRequested = false;  // Flag para indicar si hay un cambio pendiente
+unsigned long gasChangeRequestTime = 0;  // Momento en que se solicitó el cambio
+const long gasChangeConfirmationInterval = 500;  // Intervalo para enviar confirmación (500ms)
+unsigned long lastGasConfirmationTime = 0;  // Último momento de confirmación
+String requestedGasType = "";  // Tipo de gas solicitado
+
 // Configuración del sensor MQ7 para monóxido de carbono
 const int RL_VALUE = 10;   // Resistencia RL del módulo en Kilo ohms (valor típico)
-// R0 se calcula según la fórmula proporcionada: R0=((10*((4.9-0.626)/(0.626)))/(26.75))
-// Valor precalculado de R0
 const float R0 = 2.61;     // Resistencia R0 calibrada (en KΩ)
 
 // Configuración para lecturas múltiples para aumentar precisión
 const int READ_SAMPLE_INTERVAL = 100;  // Tiempo entre muestras (ms)
 const int READ_SAMPLE_TIMES = 5;       // Número de muestras
-//--------------------------------------------------------------------------------
+
 // Definición de los gases que puede medir el MQ7
 enum GasType {
   GAS_CO = 0,        // Monóxido de carbono
@@ -121,53 +126,154 @@ void initGasCalibrations() {
 float getGasConcentration(float rs_ro_ratio, int gasIndex) {
   return pow(10, gasCalibrations[gasIndex].coord + gasCalibrations[gasIndex].scope * log10(rs_ro_ratio));
 }
-//--------------------------------------------------------------------------------
+
+// Función para buscar el índice de un gas por su nombre
+int findGasIndexByName(String gasName) {
+  for (int i = 0; i < GAS_COUNT; i++) {
+    if (gasName.equalsIgnoreCase(gasCalibrations[i].name)) {
+      return i;
+    }
+  }
+  return -1;  // No encontrado
+}
+
+// Función para enviar confirmación de cambio de gas
+void sendGasChangeConfirmation() {
+  if (!deviceConnected) return;
+  
+  // Solo enviar confirmación si hay una solicitud pendiente
+  if (gasChangeRequested) {
+    char confirmationJson[150];
+    sprintf(confirmationJson, 
+            "{\"command\":\"gas_changed\",\"to\":\"%s\",\"success\":true,\"timestamp\":%lu,\"requested\":\"%s\"}", 
+            gasCalibrations[currentGasIndex].name, 
+            millis(),
+            requestedGasType.c_str());
+    
+    // Enviar por la característica de datos
+    pCharacteristic->setValue(confirmationJson);
+    pCharacteristic->notify();
+    
+    // También enviar al estado para que la app pueda consultar
+    pStatusCharacteristic->setValue(confirmationJson);
+    
+    Serial.print("Enviando confirmación: ");
+    Serial.println(confirmationJson);
+    
+    lastGasConfirmationTime = millis();
+  }
+}
+
+// Función para actualizar el estado del sensor
+void updateSensorStatus() {
+  if (!deviceConnected) return;
+  
+  char statusJson[150];
+  sprintf(statusJson, 
+          "{\"status\":\"ok\",\"current_gas\":\"%s\",\"gas_index\":%d,\"timestamp\":%lu}", 
+          gasCalibrations[currentGasIndex].name, 
+          currentGasIndex,
+          millis());
+  
+  pStatusCharacteristic->setValue(statusJson);
+  
+  // No hacemos notificación porque el cliente puede sondear esta característica cuando lo necesite
+}
+
 // Clase para manejar los eventos de conexión Bluetooth
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
       deviceConnected = true;  // Establecer estado de conexión
       Serial.println("Dispositivo conectado");  // Mensaje de conexión
+      
+      // Actualizar el estado del sensor cuando un dispositivo se conecta
+      updateSensorStatus();
     };
+    
     void onDisconnect(BLEServer* pServer) {
       deviceConnected = false;  // Establecer estado de desconexión
       Serial.println("Dispositivo desconectado");  // Mensaje de desconexión
+      
+      // Resetear variables de cambio de gas al desconectar
+      gasChangeRequested = false;
+      requestedGasType = "";
+    }
+};
+
+// Clase para manejar lecturas de la característica de estado
+class StatusCallbacks: public BLECharacteristicCallbacks {
+    void onRead(BLECharacteristic *pCharacteristic) {
+      // Actualizar el estado antes de que el cliente lo lea
+      updateSensorStatus();
+      Serial.println("Cliente solicitó lectura de estado");
     }
 };
 
 // Clase para manejar los comandos recibidos desde la aplicación
 class CommandCallbacks: public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *pCharacteristic) {
-      // Corregido: usar correctamente la función getValue() para obtener el valor
-      String valueStr = pCharacteristic->getValue();
+      // Obtener la cadena como un array de bytes y su longitud
+      String value = pCharacteristic->getValue();
       
-      if (valueStr.length() > 0) {
+      if (value.length() > 0) {
         Serial.print("Comando recibido: ");
-        Serial.println(valueStr.c_str());
+        Serial.println(value);
+        
+        // Verificar si el comando contiene un timestamp/ID (formato: "GAS:TIMESTAMP")
+        int separatorIndex = value.indexOf(':');
+        String gasName;
+        String timestamp = "";
+        
+        if (separatorIndex != -1) {
+          gasName = value.substring(0, separatorIndex);
+          timestamp = value.substring(separatorIndex + 1);
+          Serial.print("Gas: ");
+          Serial.print(gasName);
+          Serial.print(", Timestamp: ");
+          Serial.println(timestamp);
+        } else {
+          gasName = value;
+        }
+        
+        // Guardar el gas solicitado originalmente para incluirlo en las confirmaciones
+        requestedGasType = gasName;
         
         // Procesar el comando para cambiar el tipo de gas
-        // Verificar si el comando comienza con alguno de los nombres de gas
-        if (valueStr.startsWith("CO:")) {
-          currentGasIndex = GAS_CO;
-          Serial.println("Cambiando a CO");
+        int newGasIndex = -1;
+        
+        if (gasName == "CO") {
+            newGasIndex = GAS_CO;
         }
-        else if (valueStr.startsWith("H2:")) {
-          currentGasIndex = GAS_HYDROGEN;
-          Serial.println("Cambiando a H2");
+        else if (gasName == "H2") {
+            newGasIndex = GAS_HYDROGEN;
         }
-        else if (valueStr.startsWith("LPG:")) {
-          currentGasIndex = GAS_LPG;
-          Serial.println("Cambiando a LPG");
+        else if (gasName == "LPG") {
+            newGasIndex = GAS_LPG;
         }
-        else if (valueStr.startsWith("CH4:")) {
-          currentGasIndex = GAS_METHANE;
-          Serial.println("Cambiando a CH4");
+        else if (gasName == "CH4") {
+            newGasIndex = GAS_METHANE;
         }
-        else if (valueStr.startsWith("ALCOHOL:")) {
-          currentGasIndex = GAS_ALCOHOL;
-          Serial.println("Cambiando a Alcohol");
+        else if (gasName == "ALCOHOL") {
+            newGasIndex = GAS_ALCOHOL;
         }
-        else {
-          Serial.println("Comando no reconocido");
+        
+        // Si el gas es válido, programar el cambio
+        if (newGasIndex >= 0) {
+          currentGasIndex = newGasIndex;
+          Serial.print("Cambiando a gas: ");
+          Serial.println(gasCalibrations[currentGasIndex].name);
+          
+          // Marcar que hay un cambio de gas pendiente de confirmar
+          gasChangeRequested = true;
+          gasChangeRequestTime = millis();
+          
+          // Enviar la confirmación inmediatamente
+          sendGasChangeConfirmation();
+          
+          // Actualizar también el estado
+          updateSensorStatus();
+        } else {
+          Serial.println("Gas no reconocido");
         }
       }
     }
@@ -176,7 +282,6 @@ class CommandCallbacks: public BLECharacteristicCallbacks {
 // Obtener la resistencia del sensor a partir de la lectura analógica
 float getMQResistance(int raw_adc) {
   // Convertir ADC a voltaje (para ESP32 con ADC de 12 bits)
-  // El ESP32 trabaja con 0-1V por defecto, pero podemos ajustar en el cálculo
   float voltage = raw_adc * (3.3 / 4095.0);  // Conversión de ADC a voltaje
   
   // Calculamos Rs en función del voltaje y RL_VALUE
@@ -194,10 +299,9 @@ float readMQ(int mq_pin) {
   return rs / READ_SAMPLE_TIMES;  // Devolver promedio de resistencias
 }
 
-
 void setup() {
   Serial.begin(115200);  // Iniciar comunicación serial
-  Serial.println("Iniciando sensor MQ7 con Bluetooth...");  // Mensaje de inicio
+  Serial.println("Iniciando sensor MQ7 con Bluetooth (Sistema de sondeo mejorado)...");
   initGasCalibrations();
   
   // Para ESP32, usamos analogReadResolution en lugar de las funciones de driver/adc.h
@@ -207,97 +311,116 @@ void setup() {
   BLEDevice::init("ESP32S3-MQ7-Sensor");  // Inicializar dispositivo BLE
   pServer = BLEDevice::createServer();  // Crear servidor BLE
   pServer->setCallbacks(new MyServerCallbacks());  // Establecer callbacks de conexión
-  BLEService *pService = pServer->createService(SERVICE_UUID);  // Crear servicio BLE
   
-  // Característica para datos del sensor
+  // Crear servicio BLE
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+  
+  // Característica para datos del sensor (notificaciones)
   pCharacteristic = pService->createCharacteristic(
                      CHARACTERISTIC_UUID,
                      BLECharacteristic::PROPERTY_READ |
-                     BLECharacteristic::PROPERTY_WRITE |
                      BLECharacteristic::PROPERTY_NOTIFY
-                   );  // Crear característica BLE
+                   );
   pCharacteristic->addDescriptor(new BLE2902());  // Agregar descriptor de notificación
   
-  // Característica para comandos desde la app
+  // Característica para comandos desde la app (escritura)
   pCommandCharacteristic = pService->createCharacteristic(
                      COMMAND_CHAR_UUID,
-                     BLECharacteristic::PROPERTY_READ |
                      BLECharacteristic::PROPERTY_WRITE
                    );
   pCommandCharacteristic->setCallbacks(new CommandCallbacks());
   
-  pService->start();  // Iniciar servicio BLE
+  // Característica para estado del sensor (lectura)
+  pStatusCharacteristic = pService->createCharacteristic(
+                     STATUS_CHAR_UUID,
+                     BLECharacteristic::PROPERTY_READ
+                   );
+  pStatusCharacteristic->setCallbacks(new StatusCallbacks());
   
-  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();  // Obtener objeto de publicidad
-  pAdvertising->addServiceUUID(SERVICE_UUID);  // Agregar UUID de servicio a publicidad
-  pAdvertising->setScanResponse(true);  // Establecer respuesta de escaneo
-  pAdvertising->setMinPreferred(0x06);  // Establecer intervalo de publicidad mínimo
-  pAdvertising->setMinPreferred(0x12);  // Establecer intervalo de publicidad mínimo
-  BLEDevice::startAdvertising();  // Iniciar publicidad
+  // Iniciar servicio y publicidad
+  pService->start();
   
-  Serial.println("ESP32-S3 MQ7 BLE está listo para conectarse!");  // Mensaje de listo
-  Serial.println("Calibración para gases:");  // Mensaje de calibración
-  Serial.print("R0 (KΩ): ");  // Imprimir R0
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);
+  pAdvertising->setMinPreferred(0x12);
+  BLEDevice::startAdvertising();
+  
+  Serial.println("ESP32-S3 MQ7 BLE con sondeo está listo para conectarse!");
+  Serial.print("R0 (KΩ): ");
   Serial.println(R0);
 }
 
 void loop() {
-  unsigned long currentMillis = millis();  // Obtener tiempo actual
+  unsigned long currentMillis = millis();
 
-  // Enviar datos cada intervalo definido
+  // Manejar el envío periódico de datos
   if (currentMillis - previousMillis >= interval) {
-    previousMillis = currentMillis;  // Actualizar tiempo anterior
+    previousMillis = currentMillis;
     
     if (deviceConnected) {
-      // Leer la resistencia promedio del sensor
-      float rs_med = readMQ(MQ7_PIN);  // Leer resistencia promedio
-      
-      // Calcular relación Rs/R0
-      float rs_ro_ratio = rs_med / R0;  // Calcular relación Rs/R0
-      
-      // Calcular la concentración del gas en PPM
-      float ppm = getGasConcentration(rs_ro_ratio, currentGasIndex);  // Calcular concentración para el gas actual
-      
-      // Valor ADC puro para referencia
-      int mq7Value = analogRead(MQ7_PIN);  // Leer valor ADC
-      
-      // Convertir a voltaje (usando 3.3V como referencia típica en ESP32)
-      float voltage = mq7Value * (3.3 / 4095.0);  // Conversión de ADC a voltaje
+      // Leer y procesar datos del sensor
+      float rs_med = readMQ(MQ7_PIN);
+      float rs_ro_ratio = rs_med / R0;
+      float ppm = getGasConcentration(rs_ro_ratio, currentGasIndex);
+      int mq7Value = analogRead(MQ7_PIN);
+      float voltage = mq7Value * (3.3 / 4095.0);
       
       // Crear string con los datos en formato JSON
-      char txString[100];  // Buffer para string más grande (100 bytes)
-      sprintf(txString, "{\"ADC\":%d,\"V\":%.2f,\"Rs\":%.2f,\"Rs/R0\":%.3f,\"ppm\":%.2f,\"gas\":\"%s\",\"timestamp\":%lu}", 
-        mq7Value, voltage, rs_med, rs_ro_ratio, ppm, gasCalibrations[currentGasIndex].name, millis());  // Añadir timestamp
+      char txString[150];  // Buffer más grande para datos adicionales
+      sprintf(txString, 
+              "{\"ADC\":%d,\"V\":%.2f,\"Rs\":%.2f,\"Rs/R0\":%.3f,\"ppm\":%.2f,\"gas\":\"%s\",\"timestamp\":%lu,\"gas_index\":%d}", 
+              mq7Value, voltage, rs_med, rs_ro_ratio, ppm, 
+              gasCalibrations[currentGasIndex].name, millis(), currentGasIndex);
       
-      // Enviar los datos a través de Bluetooth
-      pCharacteristic->setValue(txString);  // Establecer valor de característica
-      pCharacteristic->notify();  // Notificar a los dispositivos conectados
+      // Enviar los datos
+      pCharacteristic->setValue(txString);
+      pCharacteristic->notify();
       
       // Mostrar valores por el puerto serie
-      Serial.print("Gas: "); //GAS
+      Serial.print("Gas: ");
       Serial.print(gasCalibrations[currentGasIndex].name);
-      Serial.print(", Rs: "); //RESISTENCIA
+      Serial.print(", Rs: ");
       Serial.print(rs_med);
-      Serial.print(" KΩ, Rs/R0: "); //RELACION RS/R0
+      Serial.print(" KΩ, Rs/R0: ");
       Serial.print(rs_ro_ratio);
-      Serial.print(", Concentración: "); //CONCENTRACION
+      Serial.print(", Concentración: ");
       Serial.print(ppm);
-      Serial.println(" PPM"); //PPM
-      Serial.print("Enviando: ");
-      Serial.println(txString);
+      Serial.println(" PPM");
+    }
+  }
+  
+  // Gestión de confirmaciones de cambio de gas
+  if (gasChangeRequested) {
+    // Si ha pasado suficiente tiempo desde la última confirmación, enviar otra
+    if (currentMillis - lastGasConfirmationTime >= gasChangeConfirmationInterval) {
+      sendGasChangeConfirmation();
+      
+      // Si ya pasaron varios intentos, asumir que la app recibió el cambio
+      if (currentMillis - gasChangeRequestTime >= 3000) {  // 3 segundos de intentos
+        gasChangeRequested = false;
+        Serial.println("Tiempo de confirmación de cambio de gas agotado");
+      }
     }
   }
   
   // Manejar reconexión
   if (!deviceConnected && oldDeviceConnected) {
-    delay(500);  // Esperar un momento antes de reiniciar publicidad
-    pServer->startAdvertising();  // Reiniciar publicidad
-    Serial.println("Iniciando anuncios");  // Mensaje de reinicio de publicidad
-    oldDeviceConnected = deviceConnected;  // Actualizar estado de conexión anterior
+    delay(500);
+    pServer->startAdvertising();
+    Serial.println("Iniciando anuncios");
+    oldDeviceConnected = deviceConnected;
+    
+    // Resetear flags de cambio de gas al desconectar
+    gasChangeRequested = false;
   }
   
-  // Dispositivo conectado
+  // Dispositivo conectado (cambio de estado)
   if (deviceConnected && !oldDeviceConnected) {
-    oldDeviceConnected = deviceConnected;  // Actualizar estado de conexión anterior
+    oldDeviceConnected = deviceConnected;
+    
+    // Actualizar estado inmediatamente después de conectar
+    updateSensorStatus();
   }
 }
